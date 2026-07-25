@@ -488,3 +488,822 @@ DFlash 训练时的假设是：给定相同的 target context，多个未来 tok
 | `vllm/model_executor/models/qwen3_dflash.py` | DFlashQwen3ForCausalLM — DFlash draft model 实现 |
 | `vllm/v1/spec_decode/utils.py` | `copy_and_expand_dflash_inputs_kernel` — Triton kernel 构建输入 |
 | `vllm/v1/spec_decode/llm_base_proposer.py` | `SpecDecodeBaseProposer` — 公共基类，parallel_drafting 逻辑 |
+
+---
+
+# DSpark：并行 Backbone + 序列依赖 Markov Head
+
+## 概述
+
+DSpark 是 DeepSpec 项目中的第三种推测解码方案。它在架构上介于 **MTP（全自回归）** 和 **DFlash（全并行）** 之间：
+
+| | MTP | DSpark | DFlash |
+|---|---|---|---|
+| Draft 产出方式 | 逐 token 自回归 | 并行 backbone + **序列修正** | 一次并行 forward |
+| Token 间依赖 | causal self-attention | cross-attention + Markov Head | cross-attention 仅靠 target context |
+| 序列建模 | 显式（causal mask） | **Markov Head 补丁式修正** | 隐式（target hidden states） |
+
+---
+
+## 1. 核心设计：并行骨架 + 序列补丁
+
+DSpark 的 draft 生成分两层：
+
+```
+┌──────────────────────────────────────────────────┐
+│  第一层：并行 Backbone（cross-attention）         │
+│  → 所有 MASK token 同时 attend target context     │
+│  → 产出 base_logits: [batch, block_size, vocab]   │
+│  → 完全并行，无 token 间依赖                      │
+├──────────────────────────────────────────────────┤
+│  第二层：序列 Markov Head（逐位置修正）            │
+│  → 从第 0 位开始，逐位置用上一个 token 修正 logits │
+│  → 修正后采样 → 作为下一位置的输入                │
+│  → 引入 token 间顺序依赖                          │
+└──────────────────────────────────────────────────┘
+```
+
+**第一层（并行）**：和 DFlash 类似，所有 draft 位置的 Q 同时 attend target hidden states 的 K/V，一次 forward 得到所有位置的 `base_logits`——这一步零序列依赖。
+
+**第二层（序列）**：Markov Head 逐位置修正 logits。每生成一个 token，就用它计算下一个位置的 bias。这一步是**自回归**的，引入 token 间的顺序约束。
+
+类比：Backbone 负责"看懂上文"（语义理解），Markov Head 负责"前后 token 搭配合理"（局部连贯性）。两者分工，互补。
+
+---
+
+## 2. Markov Head：三种变体
+
+### 2.1 VanillaMarkov：纯统计 bigram bias
+
+结构最简，仅两个矩阵：
+
+```
+输入: 上一个 token x_{k-1}
+         │
+    ┌────▼────┐
+    │  W₁      │  Embedding(vocab, rank)  — 将 token 压缩为 rank 维稠密向量
+    │  [V, r]  │
+    └────┬────┘
+         │ e = W₁[x_{k-1}]   shape: [rank]
+    ┌────▼────┐
+    │  W₂      │  Linear(rank, vocab, bias=False)
+    │  [r, V]  │
+    └────┬────┘
+         │
+         ▼
+    bias = W₂(W₁[x_{k-1}])    shape: [vocab]
+         │
+         ▼
+    final_logits = base_logits + bias
+```
+
+**完全不看 backbone hidden states**——只根据上一个 token ID 做纯统计 bigram bias。参数量仅 `2 × V × rank`（例如 V=150k, rank=256 时约 76M，相比 backbone 的数十亿参数极小）。
+
+### 2.2 GatedMarkovHead：上下文感知的门控
+
+VanillaMarkov 的问题：同样的前一个 token（如 "cat"），在不同上下文中的 bias 应该不同（"the cat sat" vs "the black cat from"）。
+
+GatedMarkovHead 引入一个由 backbone hidden state 控制的**门（gate）**：
+
+```
+输入: x_{k-1} + h_k（backbone hidden state）
+         │
+    ┌────┴────┬──────────────────┐
+    ▼         │                  │
+W₁[x_{k-1}]   │    gate_proj([h_k; W₁[x_{k-1}]])
+ [r]          │                  │
+    │         │                  ▼
+    │         │    gate = sigmoid(Linear([h_k; e]))
+    │         │    gate ∈ (0, 1)^r  — 每个维度一个门控值
+    │         │                  │
+    └────┬────┘                  │
+         │                       │
+         ▼                       ▼
+    gated_emb = gate ⊙ W₁[x_{k-1}]    （逐元素乘法）
+         │
+         ▼
+    bias = W₂(gated_emb)
+```
+
+**Gate 的"关掉"机制**——关键在 `gate ⊙ embedding` 的逐元素乘法：
+
+```
+W₁["cat"]  = [0.5,  -0.3]     ← token "cat" 的 rank-2 embedding
+gate       = [0.9,  0.05]     ← backbone 根据上下文 h_k 决定各维度通过比例
+
+gated_emb  = [0.9×0.5, 0.05×(-0.3)]
+           = [0.45,  -0.015]
+```
+
+| 维度 | embedding 原值 | gate | gated 结果 | 效果 |
+|------|:---:|:---:|:---:|------|
+| dim 0 | 0.5 | 0.9 | 0.45 | gate≈1 → **放行**，原信息几乎完整保留 |
+| dim 1 | -0.3 | 0.05 | -0.015 | gate≈0 → **关掉**，值被压缩到接近 0 |
+
+`W₁` 的不同维度可能编码 token 的不同属性：
+
+- **dim 0（gate=0.9，放行）**：编码"cat 后面常跟动词"（sat, ran, sleeps...）——在大多数上下文都相关
+- **dim 1（gate=0.05，关掉）**：编码"cat 后面常跟介词"（on, in, under...）——但 backbone 根据当前上下文判断介词语义不相关，将其抑制
+
+类比：`W₁[token]` 是一个**全频段均衡器**（所有可能的后续模式都编码在内），gate 是一个**上下文滤波器**（backbone 根据语义选择哪些频率通过），`W₂` 再把过滤后的信号翻译成词表空间的具体 bias。
+
+### 2.3 RNNHead：累积前缀历史的循环状态
+
+Vanilla 和 Gated 都只看上一个 token `x_{k-1}`。但有时需要更长历史——比如 "New York" 后面跟什么，取决于整个 "New York" 而不仅仅是 "York"。
+
+RNNHead 维护一个类似 GRU 的**循环状态**，在 block 内逐位置传播：
+
+```
+初始: state₀ = 0
+
+对于 k = 0, 1, 2, ...:
+  z = [state_{k-1}; W₁[x_{k-1}]; h_k]    ← 拼接三个信息源
+  proj = joint_proj(z)                    ← [*, 3×rank]
+  [gate_raw, candidate_raw, output_raw] = proj.chunk(3)
+
+  gate      = sigmoid(gate_raw)                        ← GRU 风格的更新门
+  candidate = tanh(candidate_raw)                       ← 候选新信息
+  state_k   = gate ⊙ state_{k-1} + (1-gate) ⊙ candidate ← 状态更新
+
+  bias = W₂(tanh(output_raw))             ← 输出当前步的 bias
+```
+
+**具体例子**：生成 "New York is"：
+
+```
+Step 0（生成 "York"）:
+  state = [0, 0]
+  prev_token = "New", h₀ = backbone hidden
+  → state₀ = [0.2, -0.1]          ← 吸收 "New" 的信息
+  → bias 修正 logits → 采样 "York"
+
+Step 1（生成 "is"）:
+  state = [0.2, -0.1]              ← 携带了 "New" 的信息！
+  prev_token = "York", h₁ = backbone hidden
+  gate = 0.8, candidate = tanh(...)
+  → new_state = 0.8×[0.2,-0.1] + 0.2×candidate = [0.15, -0.05]
+  → state 融合了 "New" + "York" 的联合历史
+  → bias 修正 logits → 采样 "is"（而非 "city" 或 "times"）
+```
+
+关键区别：位置 1 的 bias 不仅依赖 "York"，还通过 `state` 间接依赖 "New"。这样即使 backbone 的并行 forward 不知道 draft token 间的顺序关系，RNNHead 也能补上这个缺口。
+
+---
+
+## 3. 训练 vs 推理的差异
+
+### 3.1 训练时：Teacher Forcing（全并行）
+
+训练时使用**真实的 target token**（而非采样结果）作为 Markov Head 的输入：
+
+```python
+# qwen3/modeling.py:489-494
+if self.markov_head is not None:
+    draft_logits = self.markov_head.apply_block_logits(
+        draft_logits,
+        token_ids=prev_token_ids,        # ground-truth tokens，非采样结果
+        hidden_states=output_hidden_4d,   # backbone hidden states
+    )
+```
+
+以 RNNHead 为例，`apply_block_logits` 的实现：
+
+```python
+# markov_head.py:191-225
+def apply_block_logits(self, base_logits, *, token_ids, hidden_states):
+    state = zeros(...)
+    for k in range(block_size):
+        prev_emb = self.get_prev_embeddings(token_ids[..., k])  # 真实 token k
+        h_k = hidden_states[..., k, :]
+        state, bias = self._rnn_step(state, prev_emb, h_k)
+        output_logits.append(base_logits[..., k, :] + bias)
+    return stack(output_logits)
+```
+
+虽然代码里是 for 循环逐位置计算，但 `token_ids` 用的是 ground-truth（不是上一步的采样结果），所以**梯度计算无依赖链**——所有位置可以并行做矩阵运算。循环只是逻辑表达，不构成计算瓶颈。
+
+### 3.2 推理时：自回归采样（串行）
+
+推理时没有 ground-truth，必须用上一步的**采样结果**：
+
+```python
+# markov_head.py:55-90
+def sample_block_tokens(self, base_logits, *, first_prev_token_ids, ...):
+    prev_token_ids = first_prev_token_ids
+    for step_idx in range(proposal_len):
+        step_logits = base_logits[:, step_idx, :] + bias(prev_token_ids)
+        next_token_ids = sample_tokens(step_logits, temperature)
+        prev_token_ids = next_token_ids   # ← 采样结果喂给下一步，形成依赖链
+```
+
+这引入了串行依赖——每一步必须等上一步采样完才能算下一个 bias。但因为 Markov Head 本身极轻量（仅 `2×V×r` 参数、两次矩阵运算），串行开销远小于 backbone forward。
+
+---
+
+## 4. 与 MTP / DFlash 的架构对比
+
+```
+MTP（全自回归）:
+  draft₀ → draft₁ → draft₂ → draft₃
+  每步跑一次 draft model forward（1层transformer）
+  串行开销 = N × (1层transformer时间)
+
+DFlash（全并行）:
+  [draft₀, draft₁, draft₂, draft₃] = parallel_forward()
+  一次 forward，所有位置并行产出
+  串行开销 = 0（但缺少 token 间依赖建模）
+
+DSpark = DFlash 并行骨架 + Markov Head 序列修正:
+  base_logits = parallel_backbone()     ← 并行（同 DFlash）
+  draft₀ = sample(base_logits[0] + bias(bonus))
+  draft₁ = sample(base_logits[1] + bias(draft₀))     ← 轻量串行修正
+  draft₂ = sample(base_logits[2] + bias(draft₁))
+  draft₃ = sample(base_logits[3] + bias(draft₂))
+  串行开销 = N × (2次矩阵乘法时间)，远小于 MTP 的 N × transformer
+```
+
+**本质**：DSpark 把序列依赖建模从 transformer attention 中剥离出来，交给极轻量的 Markov Head。Backbone 负责"理解上文"（高成本、并行），Markov Head 负责"前后连贯"（低成本、串行）。
+
+---
+
+## 5. 关键代码文件索引
+
+| 文件 | 作用 |
+|---|---|
+| `deepspec/modeling/dspark/markov_head.py` | Markov Head 三种实现（Vanilla / Gated / RNN） |
+| `deepspec/modeling/dspark/qwen3/modeling.py` | Qwen3 DSpark 模型 — backbone + Markov Head 集成 |
+| `deepspec/eval/dspark/draft_ops.py` | 推理时 draft proposal 流程（`build_dspark_proposal`） |
+| `deepspec/modeling/dspark/loss.py` | 训练 loss 计算（CE + L1 + confidence） |
+| `deepspec/eval/dspark/confidence_head.py` | Confidence Head 评估（预测每个 draft 位置的接受概率） |
+| `config/dspark/dspark_qwen3_8b.py` | 训练配置（`markov_rank=256`, `markov_head_type='vanilla'`） |
+
+---
+
+# Confidence Head：草稿模型的"自知之明"
+
+## 概述
+
+Confidence Head 是 DSpark 框架中的一个轻量级组件，它在草稿模型生成每个 token 的同时，**预测该 token 被目标模型接受的概率**。这赋予了草稿模型"自省能力"——知道自己的预测有多可靠。
+
+```python
+# deepspec/modeling/dspark/common.py:43-49
+class AcceptRatePredictor(nn.Module):
+    def __init__(self, input_dim: int):
+        super().__init__()
+        self.proj = nn.Linear(int(input_dim), 1)  # 极简：单层线性投影 → 标量 logit
+
+    def forward(self, features):
+        return self.proj(features).squeeze(-1)  # [B, N, S] → [B, N, S]
+```
+
+---
+
+## 1. 它解决什么问题
+
+推测解码的核心公式：$L = \frac{T_{\text{draft}} + T_{\text{verify}}}{\tau}$
+
+DSpark 的并行 Backbone + Markov Head 解决了分子中的 $T_{\text{draft}}$ 问题，但还有一个关键瓶颈：**盲目地把整个 block 送去验证会浪费 $T_{\text{verify}}$**。
+
+两个维度的浪费来源：
+
+| 维度 | 问题 |
+|------|------|
+| **数据侧** | 不同任务接受率差异大：代码 ~77%，闲聊 ~46%，后缀 token 大概率被拒 |
+| **系统侧** | 低负载时多验证几乎免费，高负载时每个浪费的验证位置都挤占其他请求的 batch capacity |
+
+Confidence Head 正是为了回答：**"在这个位置，token 被接受的概率是多少？"**，从而支持按需截断验证。
+
+---
+
+## 2. 架构设计
+
+### 2.1 两种输入模式
+
+输入特征的拼接由 `confidence_head_with_markov` 标志控制：
+
+```
+                    ┌─────────────────────────────┐
+                    │    AcceptRatePredictor        │
+                    │    Linear(input_dim, 1)       │
+                    └──────────┬───────────────────┘
+                               │
+              ┌────────────────┼────────────────┐
+              │                                 │
+  with_markov=False                   with_markov=True
+              │                                 │
+  input = hidden_states              input = [hidden_states; markov_emb]
+  (维度: hidden_size)                (维度: hidden_size + markov_rank)
+```
+
+对应代码（`modeling.py:293-308`）：
+
+```python
+def predict_confidence_step(self, hidden_states, prev_token_ids=None):
+    if self.confidence_head_with_markov:
+        # 拼接 backbone 隐藏状态 + 前一个 token 的马氏嵌入
+        prev_embeddings = self.markov_head.get_prev_embeddings(prev_token_ids)
+        features = torch.cat([hidden_states, prev_embeddings], dim=-1)
+        return self.confidence_head(features).float()
+    # 只用 backbone 隐藏状态
+    return self.confidence_head(hidden_states).float()
+```
+
+经过 sigmoid 后得到条件接受概率：
+
+$$c_k = \sigma\left(w^\top [h_k; W_1[x_{k-1}]]\right) \in (0, 1)$$
+
+### 2.2 累积前缀存活概率
+
+根据链式法则，前 $j$ 个 token 全部被接受的**联合概率**为：
+
+$$a_{r,j} = \prod_{i \leq j} c_{r,i}$$
+
+这个累积乘积是后续 Hardware-Aware Prefix Scheduler 的**核心输入**。
+
+---
+
+## 3. 训练：监督信号从哪里来
+
+### 3.1 标签构造：目标分布与草稿分布的 L1 距离
+
+```python
+# deepspec/modeling/dspark/loss.py:60-70
+def _compute_accept_rate_3d(outputs, aligned_target_logits):
+    draft_probs = torch.softmax(outputs.draft_logits.float(), dim=-1)     # 草稿分布
+    target_probs = torch.softmax(aligned_target_logits.float(), dim=-1)   # 目标分布
+    accept_rate_3d = 1.0 - 0.5 * (draft_probs - target_probs).abs().sum(dim=-1)
+    #                   ↑ 总变分距离 / 2
+    # accept_rate ∈ [0, 1]，值越大表示分布越接近 → 被接受概率越高
+    return accept_rate_3d.clamp_(0.0, 1.0)
+```
+
+直观解释：如果两个分布在 token 上完全一致，接受率≈1.0；如果截然不同，接受率≈0.0。
+
+### 3.2 BCE Loss
+
+```python
+# loss.py:157-163
+confidence_targets = accept_rate_3d.detach()   # 目标接受率作为标签
+confidence_errors = F.binary_cross_entropy_with_logits(
+    outputs.confidence_pred.float(),   # Confidence Head 原始输出（logits）
+    confidence_targets,                # 标签（0~1 之间）
+    reduction="none",
+) * loss_weight_mask
+```
+
+### 3.3 训练时追踪的关键指标
+
+```python
+# loss.py:164-182
+confidence_probs = outputs.confidence_pred.float().sigmoid()
+confidence_error = confidence_probs - accept_rate_3d
+
+# 单点指标
+confidence_abs_error    # |σ(pred) - accept_rate|  绝对误差
+confidence_bias         # σ(pred) - accept_rate    正偏=高估，负偏=低估
+
+# 累积指标 — 核心！
+confidence_prefix_probs  = (confidence_probs * valid_mask).cumprod(dim=-1)
+confidence_prefix_targets = (accept_rate_3d * valid_mask).cumprod(dim=-1)
+confidence_cumprod_bias   # 累积前缀概率偏差 ← 直接影响调度器决策质量
+```
+
+### 3.4 τ（期望接受长度）的计算
+
+```python
+# loss.py:40-57
+def _compute_local_probabilistic_stats(outputs, accept_rate_3d, valid_block_weights):
+    valid_accept_rate = accept_rate_3d * outputs.eval_mask
+    expected_draft_accepted = valid_accept_rate.cumprod(dim=-1).sum(dim=-1)
+    tau_prob_per_block = expected_draft_accepted + 1.0  # +1 是 bonus token
+    tau_prob_sum = (tau_prob_per_block * valid_block_weights).sum()
+    return tau_prob_sum, pos_accept_sums
+```
+
+`tau_probabilistic` 是调度器的优化目标——最大化期望接受长度同时最小化不必要的验证开销。
+
+**总 loss**：
+```
+total_loss = ce_loss_alpha × CE_Loss 
+           + l1_loss_alpha × L1_Loss 
+           + confidence_head_alpha × Confidence_Loss
+```
+
+---
+
+## 4. 具体数值例子
+
+假设 `block_size=8`，对于某个输入：
+
+**Step 1: Confidence Head 预测**
+
+```
+位置 k:        0      1      2      3      4      5      6      7
+token:        the    cat    sat    on     the    mat    and    slept
+logit:        2.5    1.8    0.3   -0.5   -1.2   -2.0   -0.1   -3.0
+σ(logit):    0.924  0.858  0.574  0.378  0.231  0.119  0.475  0.047
+```
+
+**Step 2: 累积前缀存活概率**
+
+```
+位置 0: a₀ = 0.924           → P(token₀被接受)
+位置 1: a₁ = 0.924×0.858=0.793 → P(token₀且token₁都被接受)
+位置 2: a₂ = 0.793×0.574=0.455 → P(token₀且token₁且token₂都被接受)
+位置 3: a₃ = 0.455×0.378=0.172
+...
+```
+
+**Step 3: 阈值截断（threshold=0.5 时）**
+
+逐个检查 `σ(logit) < 0.5`：
+- 位置 0: 0.924 ✓ → 位置 1: 0.858 ✓ → 位置 2: 0.574 ✓
+- 位置 3: **0.378 ✗** → **在此截断！**
+
+最终只提交 `[the, cat, sat]` 共 3 个 token 给目标模型验证，节省 5/8 = 62.5% 的验证计算。
+
+---
+
+## 5. 后置校准：Sequential Temperature Scaling (STS)
+
+**为什么需要 STS？** 神经网络的置信度估计普遍存在**过度自信**问题。论文实验显示原始 Confidence Head 的 ECE（Expected Calibration Error）高达 3-8%，直接使用会导致对吞吐量的估计失真。
+
+STS 流程——从左到右逐位置校准累积概率：
+
+```
+原始: c₁, c₂, ..., c_γ
+
+Step 1: 固定 c₁ → 验证集上 grid search T₁ 最小化 ECE(σ(c₁/T₁))
+         → 校准后 ĉ₁ = σ(c₁/T₁)
+
+Step 2: 固定 ĉ₁, c₂ → grid search T₂ 最小化 ECE(ĉ₁ × σ(c₂/T₂))
+         → 校准后 ĉ₂ = σ(c₂/T₂)
+
+Step k: 固定 ĉ₁...ĉ_{k-1}, c_k → grid search T_k 
+        最小化 ECE(∏_{i≤k-1} ĉᵢ × σ(c_k/T_k))
+```
+
+**关键特性**：温度缩放是保序变换，不会破坏 token 之间的相对排序。
+
+---
+
+## 6. 评估指标
+
+评估时（`confidence_threshold=0`，不截断），Confidence Head 收集所有位置的预测与真实验证结果对比：
+
+| 指标 | 含义 | 计算方式 |
+|------|------|---------|
+| **ECE** | Expected Calibration Error | 预测概率 vs 实际接受率的校准偏差（越低越好） |
+| **AUROC** | 区分接受/拒绝位置的排序能力 | 理想值 > 0.8 |
+| **Brier Score** | 概率预测的均方误差 | $(p - y)^2$ 的均值 |
+
+同时生成 **Reliability Diagram**（可靠性图）：
+- X 轴：预测的前缀接受概率
+- Y 轴：实际观察到的接受率
+- 完美校准 = 落在 y=x 对角线上
+
+评估代码在 `deepspec/eval/dspark/confidence_head.py` 中的 `ConfidenceHeadRecorder` 类。
+
+---
+
+## 7. 关键代码文件索引
+
+| 文件 | 作用 |
+|------|------|
+| `deepspec/modeling/dspark/common.py:43-49` | `AcceptRatePredictor` — Confidence Head 模型定义 |
+| `deepspec/modeling/dspark/qwen3/modeling.py:255-268` | Confidence Head 初始化逻辑 |
+| `deepspec/modeling/dspark/qwen3/modeling.py:293-308` | `predict_confidence_step` — 推理时预测置信度 |
+| `deepspec/modeling/dspark/qwen3/modeling.py:505-517` | 训练时 confidence 特征构建 |
+| `deepspec/modeling/dspark/loss.py:60-70` | `_compute_accept_rate_3d` — 训练标签计算 |
+| `deepspec/modeling/dspark/loss.py:157-182` | Confidence BCE Loss + 累积偏差追踪 |
+| `deepspec/modeling/dspark/loss.py:40-57` | `tau_probabilistic` — 期望接受长度 τ 计算 |
+| `deepspec/eval/dspark/confidence_head.py` | `ConfidenceHeadRecorder` — 评估：ECE/AUROC/Brier + Reliability Diagram |
+| `deepspec/eval/dspark/draft_ops.py:57-79` | `_predict_confidence_logits` — 推理时调用 Confidence Head |
+| `deepspec/eval/dspark/draft_ops.py:82-93` | `_confident_prefix_length` — 基于置信度的前缀截断 |
+
+---
+
+# Hardware-Aware Prefix Scheduler：硬件感知前缀调度器
+
+## 概述
+
+Hardware-Aware Prefix Scheduler 是 DSpark 框架的**推理端调度组件**。它接收所有活跃请求的置信度序列和硬件容量曲线，**动态决定每个请求应该验证多长的草稿前缀**，以最大化全局系统吞吐量。
+
+```
+  ┌──────────────────────────────────────────────────────────┐
+  │                DSpark 推测解码循环                         │
+  │                                                          │
+  │  1. Parallel Backbone  → hidden_states [h₁, ..., h_γ]   │
+  │  2. Sequential Head    → sampled_tokens [x₁, ..., x_γ]  │
+  │  3. Confidence Head    → confidence scores [c₁, ..., c_γ]│
+  │                                                          │
+  │  4. Hardware-Aware Prefix Scheduler  ◄── 核心             │
+  │     ├→ 输入: 所有请求的 cᵣ,ⱼ + SPS(B) 曲线               │
+  │     └→ 输出: 每个请求的最优验证长度 ℓ*ᵣ                   │
+  │                                                          │
+  │  5. Target Model Verification（只验证 ℓ*ᵣ 个前缀）       │
+  └──────────────────────────────────────────────────────────┘
+```
+
+**与静态阈值的本质区别**：静态阈值对每个请求一视同仁，而硬件感知调度器根据**数据特征**（该请求的置信度）和**系统状态**（当前负载/SPS 曲线）联合决策。
+
+---
+
+## 1. SPS 曲线：调度器的"硬件地图"
+
+### 1.1 SPS 是什么
+
+**SPS = Steps Per Second**（每秒执行步数），即目标模型引擎每秒能完成的验证轮数。
+
+论文 Section 3.2.2 的精确原文：
+
+> "*Let SPS(B) denote the engine throughput, measured in **steps per second**, for a given forward-pass batch size B.*"
+
+### 1.2 横纵坐标
+
+| 轴 | 符号 | 含义 | 单位 |
+|----|------|------|------|
+| **横坐标 (X)** | $B$ | 一次验证中目标模型处理的总 token 数 | token count |
+| **纵坐标 (Y)** | $\text{SPS}(B)$ | 批次大小为 B 时每秒执行步数 | steps/second |
+
+批次大小的构成：$B = \sum_{r=1}^{R} (1 + \ell_r)$ — 每个请求 1 个 bonus token + $\ell_r$ 个验证前缀 token。
+
+### 1.3 曲线特征
+
+论文 Section 5.2 的原文：
+
+> "*the true hardware capacity SPS(B) is inherently discrete, exhibiting a **jagged, step-wise degradation**.*"
+
+SPS 曲线不是平滑函数，而是**锯齿状阶跃衰减**的非平滑阶梯曲线——因为 GPU 有离散的并行粒度边界（warp、tile、SM 分配等）。
+
+用论文附录 A 中的具体数值示意：
+
+```
+SPS(B)
+  ↑
+1.0 ┤●
+    │
+0.5 ┤    ●
+    │
+0.45┤        ●
+    │
+    └───┼───┼───┼──→ B
+        1   2   3
+```
+
+### 1.4 Profile 方法
+
+论文原文（第8页）：
+
+> "*Crucially, this capacity curve is **profiled once during engine initialization** and stored as a lightweight lookup table.*"
+
+论文没有给出具体脚本，但方法推断如下：
+
+```
+┌─────────────────────────────────────────────────┐
+│  引擎初始化阶段（离线，一次性）                     │
+│                                                   │
+│  for B in [1, 2, 4, 8, ..., B_max]:              │
+│      构造一个 batch_size = B 的 dummy forward     │
+│      预热（warmup）N_warmup 次                    │
+│      测量 N_measure 次 forward 总耗时 T           │
+│      SPS[B] = N_measure / T                      │
+│                                                   │
+│  → 存为轻量级查找表，推理时 O(1) 查询              │
+└─────────────────────────────────────────────────┘
+```
+
+---
+
+## 2. 调度算法（论文 Algorithm 1）
+
+### 2.1 问题形式化
+
+服务系统中有 $R$ 个活跃请求，每个请求 $r$ 有 $\gamma$ 个候选 token 及其校准后的置信度 $\hat{c}_{r,1}, \ldots, \hat{c}_{r,\gamma}$。
+
+**目标**：选择截断长度 $\ell_r^* \in \{0, \ldots, \gamma\}$，最大化全局吞吐量：
+
+$$\Theta = \tau^* \cdot \text{SPS}(B) = \left(\sum_{r=1}^R \left[1 + \sum_{j=1}^{\ell_r} a_{r,j}\right]\right) \cdot \text{SPS}\left(\sum_{r=1}^R (1 + \ell_r)\right)$$
+
+其中 $a_{r,j} = \prod_{i \leq j} c_{r,i}$ 是前缀累积存活概率。
+
+### 2.2 算法步骤
+
+```
+Algorithm 1: Hardware-Aware Prefix Scheduler
+
+输入: 活跃请求 r∈{1,...,R}
+      校准后置信度 c_{r,1},...,c_{r,γ}
+      Profiled SPS(B) 查找表
+
+1. 对每个请求 r，计算前缀存活概率:
+   a_{r,j} ← ∏_{i≤j} c_{r,i}   (j=1,...,γ)
+
+2. 构建候选空间 E ← {(r, j) | a_{r,j} > 0}
+   按 a_{r,j} 降序排列
+
+3. 初始化:
+   ℓ_r ← 0 (所有请求)
+   B ← R     (起始 batch = 每请求的 bonus token)
+   τ* ← R    (起始期望接受 = 每请求 1 个 bonus)
+   Θ_best ← R · SPS(R)
+
+4. 按 a_{r,j} 从高到低贪心遍历:
+   对每个 (r, j):
+     ℓ_r ← j
+     B ← B + 1
+     τ* ← τ* + a_{r,j}
+     Θ_current ← τ* · SPS(B)     ← O(1) 查表
+
+     if Θ_current > Θ_best:
+         Θ_best ← Θ_current
+         ℓ*_r ← ℓ_r
+     else:
+         break   ← early-stop: 后续候选置信度更低，不可能改善
+
+5. 返回 {ℓ*_r}
+```
+
+**核心直觉**：
+- 按置信度从高到低贪心选择 token（高置信度的优先获得验证资格）
+- 每增加一个验证 token → $B \uparrow$ → $\text{SPS}(B) \downarrow$（每步变慢）
+- 权衡：$\tau^*$ 的提升 vs SPS 的下降
+- 当吞吐不再改善时停止——低置信度的后缀不值得拖慢整个 batch
+
+---
+
+## 3. 具体数值例子
+
+假设 4 个并发请求，$\gamma = 5$：
+
+### Step 1: Confidence Head 输出（校准后）
+
+```
+请求 1 (代码生成):   c = [0.95, 0.90, 0.85, 0.70, 0.50]
+请求 2 (代码生成):   c = [0.92, 0.88, 0.80, 0.65, 0.45]
+请求 3 (闲聊):       c = [0.80, 0.60, 0.40, 0.25, 0.15]
+请求 4 (闲聊):       c = [0.75, 0.55, 0.35, 0.20, 0.10]
+```
+
+### Step 2: 累积存活概率 $a_{r,j}$
+
+```
+位置 j:            1      2      3      4      5
+请求 1:           0.950  0.855  0.727  0.509  0.254
+请求 2:           0.920  0.810  0.648  0.421  0.189
+请求 3:           0.800  0.480  0.192  0.048  0.007
+请求 4:           0.750  0.413  0.144  0.029  0.003
+```
+
+### Step 3: 构建候选空间，按 $a_{r,j}$ 降序
+
+```
+排名  (r,j)   a_{r,j}
+ #1   (1,1)   0.950
+ #2   (2,1)   0.920
+ #3   (1,2)   0.855
+ #4   (2,2)   0.810
+ #5   (3,1)   0.800
+ #6   (4,1)   0.750
+ #7   (1,3)   0.727
+ #8   (2,3)   0.648
+ #9   (1,4)   0.509
+#10   (3,2)   0.480
+#11   (2,4)   0.421
+#12   (4,2)   0.413
+#13   (1,5)   0.254
+#14   (3,3)   0.192
+#15   (2,5)   0.189
+#16   (4,3)   0.144
+#17   (3,4)   0.048
+#18   (4,4)   0.029
+#19   (3,5)   0.007
+#20   (4,5)   0.003
+```
+
+### Step 4: 贪心调度（结合 profiled SPS 曲线）
+
+假设 SPS(B) 查找表：
+
+```
+B:         4     5     6     7     8     9    10    11    12
+SPS(B):  100    98    95    91    86    80    73    65    56
+```
+
+贪心遍历：
+
+```
+初始: B=4, τ*=4, Θ_best=4×100=400, ℓ*=[0,0,0,0]
+
+ #1 a(1,1)=0.950: B=5, τ*=4.95, Θ=4.95×98=485.1 > 400 → ℓ₁=1
+ #2 a(2,1)=0.920: B=6, τ*=5.87, Θ=5.87×95=557.7 > 485  → ℓ₂=1
+ #3 a(1,2)=0.855: B=7, τ*=6.73, Θ=6.73×91=612.0 > 557  → ℓ₁=2
+ #4 a(2,2)=0.810: B=8, τ*=7.54, Θ=7.54×86=648.0 > 612  → ℓ₂=2
+ #5 a(3,1)=0.800: B=9, τ*=8.34, Θ=8.34×80=667.2 > 648  → ℓ₃=1
+ #6 a(4,1)=0.750: B=10,τ*=9.09, Θ=9.09×73=663.6 < 667  → break!
+```
+
+最终结果：
+
+```
+请求 1 (代码):  ℓ*₁ = 2  [████████░░░]  验证 2/5 → 节省 60%
+请求 2 (代码):  ℓ*₂ = 2  [████████░░░]  验证 2/5 → 节省 60%
+请求 3 (闲聊):  ℓ*₃ = 1  [████░░░░░░░]  验证 1/5 → 节省 80%
+请求 4 (闲聊):  ℓ*₄ = 0  [░░░░░░░░░░░]  验证 0/5 → 节省 100%
+
+总验证 token = 5（含 bonus: 4×1 + 2+2+1+0 = 9）
+固定验证:     4 × (1+5) = 24 token
+节省:         62.5% 的验证计算
+```
+
+**关键观察**：
+- 代码类请求（高置信度）获得更多验证机会
+- 闲聊类请求（低置信度）只验证最前面的 token 甚至不验证
+- `a(4,1)=0.750` 虽然绝对值不低，但排在 #6，此时 SPS(9)→SPS(10) 的跌幅太大，边际收益为负
+
+---
+
+## 4. 工程挑战与生产适配
+
+### 4.1 锯齿 SPS 的局部最优问题
+
+平滑 SPS 假设下，Algorithm 1 的 early-stopping 能找到全局最优（$\Theta(B)$ 单峰）。但真实 SPS 是锯齿状的——$\Theta(B)$ 可能先降再升，导致 early-stopping 陷入局部最优。
+
+论文解决方案（Section 5.2）：**生产部署中移除 early-stopping break**，做**无约束全局搜索**。但直接做全局搜索会破坏因果性（non-anticipating property）。
+
+### 4.2 异步调度：解决因果性问题
+
+无约束全局搜索意味着决策时可能"看到"未来的 token 值——这是推测解码必须避免的。
+
+生产部署方案——**异步调度**（论文 Section 5.2）：
+
+```
+时间线:
+  Step t-2          Step t-1          Step t (当前)
+  ─────────         ─────────         ─────────
+  生成 c_{r,j}      用 t-2 的置信度   严格用当前置信度
+  存入历史缓存      估算容量 K         排序候选token
+                    决定截断长度       Top-K 准入
+                    
+  历史预测用于       ◄────────────────► 置信度排序用
+  确定容量上限 K     异步解耦（2步延迟）   最新的值保证保序
+```
+
+**两层设计**：
+- **截断长度 K**（容量上限）：用两步前的历史置信度估算 → 避免因果泄露
+- **候选排序**：严格用最新的校准置信度 → 保证高置信度 token 优先验证
+
+```
+核心原则:
+  "the most confident draft tokens are always prioritized for verification"
+  最高置信度的草稿 token 始终被优先验证
+```
+
+### 4.3 ZOS（Zero-Overhead Scheduling）兼容
+
+ZOS 要求当前 step 的 batch size 在下个 step 开始前就确定，而同步调度会卡住 GPU 流水线。异步设计**完全隐藏调度延迟**，与 ZOS 无缝集成。
+
+---
+
+## 5. 静态阈值 vs 硬件感知调度
+
+论文实验（Figure 5）展示了静态阈值在不同领域的表现差异：
+
+```
+置信度阈值 sweep（Qwen3-4B）:
+
+        阈值 0       →      阈值 0.6
+Math:  接受率 76.9%   →   92.5%（接受 tokens 更多被保留）
+Code:  接受率 67.6%   →   92.0%
+Chat:  接受率 45.7%   →   95.7%（pruning 最显著，从浪费到高效）
+```
+
+静态阈值的问题：对所有请求一刀切，不考虑系统负载。阈值 0.6 在低负载时过于严格（浪费了本可以免费验证的 token），在高负载时可能又不够严格（仍浪费 batch capacity）。
+
+硬件感知调度：负载低时（SPS 比率接近 1），几乎所有高置信 token 都会获得验证资格；负载高时（SPS 比率低），只验证最高置信的前缀——**负载感知的动态决策**。
+
+---
+
+## 6. 论文对调度的总结
+
+> "*By preventing severe throughput degradation under strict interactivity constraints, DSpark enables performance tiers that were previously unattainable, shifting the Pareto frontier of our serving system.*"
+
+在 DeepSeek-V4 生产环境中，DSpark 相比 MTP-1 baseline：
+- **V4-Flash**：per-user 生成速度提升 **60%–85%**
+- **V4-Pro**：per-user 生成速度提升 **57%–78%**
+- 在严格 SLA 约束下（Flash 120 TPS、Pro 50 TPS）突破 baseline 的性能悬崖
+
+---
+
+## 7. 关键代码文件索引
+
+| 文件 | 作用 |
+|------|------|
+| `deepspec/eval/dspark/draft_ops.py:82-93` | `_confident_prefix_length` — 静态阈值前缀截断（离线评估用） |
+| `deepspec/eval/dspark/draft_ops.py:96-153` | `build_dspark_proposal` — 推理 proposal 完整流程 |
+| `deepspec/eval/dspark/confidence_head.py:30-171` | `PerPositionConfidenceMetrics` — ECE/AUROC/Brier 计算 |
+| `deepspec/eval/dspark/confidence_head.py:313-606` | `ConfidenceHeadRecorder` — 可靠性图 + TensorBoard |
+| `deepspec/eval/dspark/evaluator.py:36-66` | Evaluator 中 Confidence Head 集成 |
+| `deepspec/modeling/dspark/loss.py:40-57` | `tau_probabilistic` — 训练时 τ 计算 |
+| DSpark 论文 Section 3.2.2 | Algorithm 1 — 硬件感知前缀调度器 |
+| DSpark 论文 Section 5.2 | 异步调度 + ZOS 适配 + 锯齿 SPS 全局搜索 |
